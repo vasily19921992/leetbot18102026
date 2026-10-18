@@ -1,0 +1,139 @@
+--- main.go
++++ main.go
+@@ -18,6 +18,7 @@
+ 	"net/smtp"
+ 	"net/url"
+ 	"os"
++	"path"
+ 	"path/filepath"
+ 	"sort"
+ 	"strconv"
+@@ -94,8 +95,19 @@
+ 
+ func main() {
+ 	loadDotEnv(".env")
+-	path := env("DATA_FILE", filepath.Join("backend", "data", "app.json"))
+-	store, err := loadStore(path)
++	dataPath := env("DATA_FILE", "")
++	if dataPath == "" {
++		for _, candidate := range []string{filepath.Join("data", "app.json"), filepath.Join("backend", "data", "app.json")} {
++			if _, err := os.Stat(candidate); err == nil {
++				dataPath = candidate
++				break
++			}
++		}
++		if dataPath == "" {
++			dataPath = filepath.Join("data", "app.json")
++		}
++	}
++	store, err := loadStore(dataPath)
+ 	if err != nil {
+ 		log.Fatal(err)
+ 	}
+@@ -128,7 +140,14 @@
+ 	mux.HandleFunc("POST /api/payment/start", s.startPayment)
+ 	mux.HandleFunc("GET /api/payment/status", s.paymentStatus)
+ 	mux.Handle("/", s.frontend())
+-	addr := env("LISTEN_ADDR", ":8080")
++	addr := env("LISTEN_ADDR", "")
++	if addr == "" {
++		if port := os.Getenv("PORT"); port != "" {
++			addr = ":" + port
++		} else {
++			addr = ":8080"
++		}
++	}
+ 	log.Printf("Летри запущен на %s", addr)
+ 	log.Fatal(http.ListenAndServe(addr, secureHeaders(mux)))
+ }
+@@ -945,21 +964,83 @@
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("X-Content-Type-Options", "nosniff")
+ 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+-		w.Header().Set("X-Frame-Options", "DENY")
++		// Telegram Mini App loads inside Telegram WebView; DENY would break it.
++		// Allow self + Telegram web origins for framing.
++		w.Header().Set("Content-Security-Policy", "frame-ancestors 'self' https://web.telegram.org https://telegram.org https://*.telegram.org")
++		// CORS: same-origin SPA does not need it, but keep safe defaults for API tools / previews.
++		origin := r.Header.Get("Origin")
++		if origin != "" {
++			if allowOrigin(origin) {
++				w.Header().Set("Access-Control-Allow-Origin", origin)
++				w.Header().Set("Access-Control-Allow-Credentials", "true")
++				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
++				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
++				w.Header().Set("Vary", "Origin")
++			}
++		}
++		if r.Method == http.MethodOptions {
++			w.WriteHeader(http.StatusNoContent)
++			return
++		}
+ 		next.ServeHTTP(w, r)
+ 	})
+ }
++
++func allowOrigin(origin string) bool {
++	if origin == "" {
++		return false
++	}
++	// Same host as the public app (Render / custom domain) or local dev.
++	allowed := []string{
++		"http://localhost:5173",
++		"http://127.0.0.1:5173",
++		"http://localhost:8080",
++		"http://127.0.0.1:8080",
++		"https://leetbot18102026.onrender.com",
++	}
++	for _, a := range allowed {
++		if origin == a {
++			return true
++		}
++	}
++	// Optional extra origins via APP_CORS_ORIGINS=comma,separated
++	for _, extra := range strings.Split(os.Getenv("APP_CORS_ORIGINS"), ",") {
++		if strings.TrimSpace(extra) == origin {
++			return true
++		}
++	}
++	return false
++}
+ func (s *Server) frontend() http.Handler {
+-	if _, err := os.Stat(filepath.Join("frontend", "dist")); err == nil {
+-		return http.FileServer(http.Dir(filepath.Join("frontend", "dist")))
++	dist := filepath.Join("frontend", "dist")
++	if _, err := os.Stat(dist); err != nil {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
++				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++				_, _ = w.Write([]byte("API работает, но frontend/dist не собран.\n\nНа Render в Build Command укажи:\n  cd frontend && npm ci && npm run build\n\nЛокально: cd frontend && npm install && npm run build, затем go run ."))
++				return
++			}
++			http.NotFound(w, r)
++		})
+ 	}
++	fs := http.FileServer(http.Dir(dist))
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		if r.URL.Path == "/" {
+-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+-			_, _ = w.Write([]byte("API работает. В frontend запусти npm install && npm run dev."))
++		// Never let the static handler swallow /api (belt-and-suspenders).
++		if strings.HasPrefix(r.URL.Path, "/api/") {
++			http.NotFound(w, r)
++			return
++		}
++		// SPA fallback: if the requested file does not exist, serve index.html.
++		clean := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
++		if clean == "" || clean == "." {
++			clean = "index.html"
++		}
++		full := filepath.Join(dist, filepath.FromSlash(clean))
++		if info, err := os.Stat(full); err != nil || info.IsDir() {
++			http.ServeFile(w, r, filepath.Join(dist, "index.html"))
+ 			return
+ 		}
+-		http.NotFound(w, r)
++		fs.ServeHTTP(w, r)
+ 	})
+ }
+ func loadDotEnv(path string) {

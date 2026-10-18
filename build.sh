@@ -4,6 +4,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# Apply production fixes if patch is present (idempotent-ish: skip if already applied)
+if [ -f main.go.patch ]; then
+  if ! grep -q 'frame-ancestors' main.go 2>/dev/null; then
+    echo "→ applying main.go.patch"
+    patch -p0 < main.go.patch
+    mkdir -p backend
+    cp main.go backend/main.go
+  else
+    echo "→ main.go already patched"
+  fi
+fi
+
 ensure_node() {
   if command -v node >/dev/null 2>&1; then
     local major
