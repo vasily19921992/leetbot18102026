@@ -1,0 +1,21 @@
+{
+  "users": {
+    "vasilijkalinovskij983@gmail.com": {
+      "email": "vasilijkalinovskij983@gmail.com",
+      "passwordHash": "pbkdf2$80000$6a11a3c84537eb70bb0a68844af974a7$27dd28197d6743c77f6a7a6e3e1b0459909d8d304e4870868e24e6b535b1445d",
+      "createdAt": "2026-10-05T11:46:22.9492116Z",
+      "trialEndsAt": "2026-10-06T11:46:22.9492116Z",
+      "paidUntil": "0001-01-01T00:00:00Z",
+      "emailVerified": true,
+      "verificationCode": "",
+      "verificationUntil": "0001-01-01T00:00:00Z",
+      "completed": [
+        1,
+        2
+      ],
+      "focusSeconds": 170
+    }
+  },
+  "payments": {},
+  "processed": {}
+}
