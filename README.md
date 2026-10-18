@@ -31,3 +31,29 @@ Vite проксирует /api на Go-сервер localhost:8080. Аккаун
 В папке frontend выполни npm install и npm run build. Затем из корня запусти go run ./backend. Go отдаёт интерфейс из frontend/dist и API на порту 8080.
 
 Для production включи HTTPS, задай APP_SECURE_COOKIES=true, длинный случайный SESSION_SECRET, APP_ENV=production, SMTP и настройки Telegram. Не публикуй пароли, токены ботов и webhook-секреты.
+
+## Деплой на Render
+
+1. Подключи репозиторий к Render (Web Service, runtime Go).
+2. **Build Command:** `bash build.sh`
+3. **Start Command:** `./leetri`
+4. **Health Check Path:** `/api/health`
+5. Переменные окружения (минимум):
+   - `APP_ENV=production`
+   - `APP_SECURE_COOKIES=true`
+   - `SESSION_SECRET` — длинный случайный секрет (≥32 символов)
+   - `DATA_FILE=data/app.json`
+   - `TELEGRAM_BOT_TOKEN` и `TELEGRAM_WEBHOOK_SECRET` — для Mini App и Stars
+6. После деплоя открой `https://<сервис>.onrender.com/` — должен открыться интерфейс (не текст «API работает»).
+7. В BotFather укажи URL Mini App: `https://<сервис>.onrender.com/`
+8. Webhook: `https://<сервис>.onrender.com/api/telegram/webhook` с тем же `secret_token`.
+
+На бесплатном плане Render диск эфемерный: данные `data/app.json` сбрасываются при redeploy. Для постоянного хранения подключи Persistent Disk или внешнюю БД.
+
+Локальная проверка production-сборки:
+
+```bash
+cd frontend && npm ci && npm run build && cd ..
+go run .
+# открой http://localhost:8080
+```
