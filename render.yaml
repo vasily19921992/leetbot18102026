@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: leetbot18102026
+    runtime: go
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: ./leetri
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_SECURE_COOKIES
+        value: "true"
+      - key: DATA_FILE
+        value: data/app.json
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: APP_CORS_ORIGINS
+        sync: false

@@ -4,5 +4,6 @@ backend/data/
 .env
 *.tmp
 .cache/
-.env.example
 *.tsbuildinfo
+.tools/
+leetri
