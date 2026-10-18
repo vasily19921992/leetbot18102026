@@ -2,10 +2,21 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ArrowDownRight, ArrowLeft, ArrowRight, ArrowUpRight, Award, BookOpen, Check, ChevronDown, CircleHelp, Clock3, Flame, Grid2X2, LockKeyhole, LogIn, LogOut, Menu, Play, Sparkles, Target, X, Zap } from "lucide-react";
 
 type Page = "home" | "train" | "schulte" | "progress";
-type User = { email: string; accessUntil: string; accessActive: boolean; plan: "trial" | "paid"; completed: number[]; focusSeconds: number };
+type User = { email: string; name?: string; telegram?: boolean; accessUntil: string; accessActive: boolean; plan: "trial" | "paid"; completed: number[]; focusSeconds: number };
 type Exercise = { id: number; title: string; category: string; level: number; levelName: string; text: string; question: string; options: string[]; correctOption: number };
 type AuthMode = "login" | "register";
-type Payment = Record<string, string>;
+type TelegramWebApp = {
+  initData: string;
+  ready: () => void;
+  expand: () => void;
+  openInvoice?: (url: string, callback: (status: "paid" | "cancelled" | "failed") => void) => void;
+};
+
+declare global {
+  interface Window {
+    Telegram?: { WebApp?: TelegramWebApp };
+  }
+}
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { credentials: "include", ...options, headers: { "Content-Type": "application/json", ...options.headers } });
@@ -49,27 +60,10 @@ export default function App() {
   const [authMode, setAuthMode] = useState<AuthMode>("register");
   const [exerciseId, setExerciseId] = useState<number|null>(null);
   const [guestDone, setGuestDone] = useState(localDone);
-  const [payment, setPayment] = useState<Payment|null>(null);
   const [toast, setToast] = useState("");
   const [mobileMenu, setMobileMenu] = useState(false);
   const [best, setBest] = useState<number|null>(() => { const n=Number(localStorage.getItem("letri.schulteBest")); return n>0?n:null; });
 
-  useEffect(() => {
-    if (new URLSearchParams(location.search).get("payment") !== "waiting") return;
-    let attempts = 0;
-    const timer = window.setInterval(() => {
-      attempts++;
-      api<{user:User}>("/api/me").then((data) => {
-        setUser(data.user);
-        if (data.user.plan === "paid") {
-          setToast("Оплата подтверждена. Доступ открыт на 30 дней.");
-          window.clearInterval(timer);
-        }
-      }).catch(() => undefined);
-      if (attempts >= 24) window.clearInterval(timer);
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, []);
   useEffect(() => {
     const openSchulte = () => {
       setPage("schulte");
@@ -81,16 +75,22 @@ export default function App() {
   }, []);
   useEffect(() => {
     api<Exercise[]>("/api/exercises").then(setExercises).catch(() => setBackendError("Сервер пока не запущен. Запусти backend по инструкции в README, чтобы открыть упражнения и аккаунт."));
-    api<{user:User}>("/api/me").then((data) => setUser(data.user)).catch(() => undefined);
-    if (new URLSearchParams(location.search).get("payment")==="waiting") setToast("Платёж проверяется ЮMoney. Доступ включится после подтверждения перевода.");
+    const telegram = window.Telegram?.WebApp;
+    if (telegram?.initData) {
+      telegram.ready();
+      telegram.expand();
+      api<{user:User}>("/api/telegram/auth",{method:"POST",body:JSON.stringify({initData:telegram.initData})})
+        .then((data) => setUser(data.user))
+        .catch((error) => setBackendError(error instanceof Error ? error.message : "Не удалось проверить Telegram."));
+    } else {
+      api<{user:User}>("/api/me").then((data) => setUser(data.user)).catch(() => undefined);
+    }
   }, []);
   useEffect(() => {
     if (!toast) return;
     const timer=window.setTimeout(() => setToast(""),5000);
     return () => window.clearTimeout(timer);
   },[toast]);
-  useEffect(() => { if(payment) (document.getElementById("yoomoney-payment-form") as HTMLFormElement | null)?.requestSubmit(); },[payment]);
-
   const completed = user?.completed ?? guestDone;
   const activeExercise = exercises.find((item) => item.id===exerciseId) ?? null;
   const locked = !user || !user.accessActive;
@@ -112,7 +112,30 @@ export default function App() {
   }
   async function beginPayment() {
     if(!user) { openAuth(); return; }
-    try { setPayment(await api<Payment>("/api/payment/start",{method:"POST",body:"{}"})); }
+    try {
+      const {invoiceLink,paymentId}=await api<{invoiceLink:string;paymentId:string}>("/api/payment/start",{method:"POST",body:"{}"});
+      const telegram=window.Telegram?.WebApp;
+      if(!telegram?.openInvoice) throw new Error("Оплату Telegram Stars можно открыть только внутри Telegram.");
+      telegram.openInvoice(invoiceLink,(status)=>{
+        if(status==="paid") {
+          void (async()=>{
+            for(let attempt=0;attempt<20;attempt++){
+              const result=await api<{paid:boolean}>("/api/payment/status?id="+encodeURIComponent(paymentId));
+              if(result.paid){
+                const data=await api<{user:User}>("/api/me");
+                setUser(data.user);
+                setToast("Оплата подтверждена. Доступ открыт на 30 дней.");
+                return;
+              }
+              await new Promise((resolve)=>window.setTimeout(resolve,1000));
+            }
+            setToast("Платёж получен. Доступ обновится после подтверждения Telegram.");
+          })().catch((error)=>setToast(error instanceof Error?error.message:"Не удалось проверить оплату."));
+        } else if(status==="failed") {
+          setToast("Не удалось завершить оплату Telegram Stars.");
+        }
+      });
+    }
     catch(error) { setToast(error instanceof Error ? error.message : "Не удалось подготовить оплату."); }
   }
   function logout() {
@@ -139,10 +162,6 @@ export default function App() {
   }
 
   return <div className="app-shell">
-    {payment&&<form id="yoomoney-payment-form" className="hidden-form" action={payment.action} method="POST">
-      {Object.entries(payment).filter(([key])=>key!=="action").map(([key,value])=><input key={key} type="hidden" name={key} value={value}/>)}
-      <button type="submit">Перейти к оплате</button>
-    </form>}
     <header className="site-header">
       <a className="brand" href="#" onClick={(e)=>{e.preventDefault();navigate("home");}}>
         <span className="brand-mark"><span>ле</span><b>т</b></span><span className="brand-copy"><strong>ЛЕТРИ</strong><small>МЫСЛИ В ТОНУСЕ</small></span>
@@ -151,7 +170,7 @@ export default function App() {
         {navItems.map((item)=><button key={item.id} className={"nav-link "+(page===item.id?"nav-active":"")} onClick={()=>navigate(item.id)}>{item.label}</button>)}
       </nav>
       <div className="header-actions">
-        {user?<button className="account-pill" title={user.email} onClick={()=>navigate("progress")}><span className="account-dot"/>{user.email.split("@")[0]}</button>
+        {user?<button className="account-pill" title={user.email||user.name||"Telegram"} onClick={()=>navigate("progress")}><span className="account-dot"/>{user.email?user.email.split("@")[0]:user.name||"Telegram"}</button>
           :<button className="login-link" onClick={()=>openAuth("login")}><LogIn size={16}/>Войти</button>}
         <button className="header-cta" onClick={()=>user?startExercise():openAuth()}>{user?"Продолжить":"Начать бесплатно"}<ArrowUpRight size={15}/></button>
       </div>
@@ -208,7 +227,7 @@ function HomePage(props:{completed:number;streak:number;onStart:()=>void;onAuth:
       <div className="how-copy"><span className="section-kicker">НЕ ГОНКА. РИТМ.</span><h2>Мозгу полезны<br/>короткие паузы<br/>на внимание.</h2><p>Когда мы читаем внимательно, ищем закономерности или удерживаем взгляд на задаче, мы практикуем концентрацию. Летри превращает такую практику в спокойный ежедневный ритуал — без рекордов и бесконечных уведомлений.</p><div className="how-points"><div><span>01</span><p><b>Один текст за раз</b><small>Упражнения короткие, сложность растёт постепенно.</small></p></div><div><span>02</span><p><b>Твой темп — правильный</b><small>Никаких штрафов за паузы и пропущенные дни.</small></p></div></div><button className="text-button text-button-dark" onClick={props.onStart}>Попробовать упражнение <ArrowRight size={16}/></button></div>
     </section>
     <section className="quote-band section-wrap"><span className="quote-star">✳</span><p>Удели себе десять минут.<br/><em>В остальное время мир подождёт.</em></p><div className="quote-side"><span>ТВОЙ СЕГОДНЯШНИЙ РИТМ</span><strong>{props.streak?props.streak+" дн. подряд":"может начаться сегодня"}</strong><small>{props.completed?props.completed+" заданий уже позади":"первая практика — бесплатно"}</small></div></section>
-    <section className="bottom-cta section-wrap"><div><span className="section-kicker">ГОТОВ НАЧАТЬ?</span><h2>Один шаг. Одна строка.<br/>И снова в фокусе.</h2></div><div className="bottom-cta-action"><button className="button button-yellow" onClick={props.onStart}>Открыть тренировку <ArrowRight size={17}/></button><span>Бесплатно на 1 день · 150 ₽ в месяц</span></div></section>
+    <section className="bottom-cta section-wrap"><div><span className="section-kicker">ГОТОВ НАЧАТЬ?</span><h2>Один шаг. Одна строка.<br/>И снова в фокусе.</h2></div><div className="bottom-cta-action"><button className="button button-yellow" onClick={props.onStart}>Открыть тренировку <ArrowRight size={17}/></button><span>Бесплатно на 1 день · 200 ⭐ в месяц</span></div></section>
   </>;
 }
 
@@ -259,7 +278,7 @@ function TrainingPage(props:{exercises:Exercise[];completed:number[];active:Exer
   </section>;
 }
 function AccessGate(props:{guest:boolean;onAction:()=>void}) {
-  return <section className="locked-page section-wrap"><div className="locked-card"><span className="locked-icon"><LockKeyhole size={24}/></span><span className="section-kicker">{props.guest?"БЕСПЛАТНЫЙ ДЕНЬ":"ТВОЯ ПРАКТИКА ЖДЁТ"}</span><h1>{props.guest?<>Открой свой<br/>первый день.</>:<>Сделай паузу<br/>и вернись завтра.</>}</h1><p>{props.guest?"Создай аккаунт, чтобы включить бесплатные 24 часа и сохранить свой прогресс.":"Оформи доступ на 30 дней, чтобы продолжить с того же задания. Твой прогресс останется с тобой."}</p><button className="button button-dark" onClick={props.onAction}>{props.guest?"Начать бесплатно":"Продлить за 150 ₽"} <ArrowRight size={17}/></button></div></section>;
+  return <section className="locked-page section-wrap"><div className="locked-card"><span className="locked-icon"><LockKeyhole size={24}/></span><span className="section-kicker">{props.guest?"БЕСПЛАТНЫЙ ДЕНЬ":"ТВОЯ ПРАКТИКА ЖДЁТ"}</span><h1>{props.guest?<>Открой свой<br/>первый день.</>:<>Сделай паузу<br/>и вернись завтра.</>}</h1><p>{props.guest?"Создай аккаунт, чтобы включить бесплатные 24 часа и сохранить свой прогресс.":"Оформи доступ на 30 дней, чтобы продолжить с того же задания. Твой прогресс останется с тобой."}</p><button className="button button-dark" onClick={props.onAction}>{props.guest?"Начать бесплатно":"Продлить за 200 ⭐"} <ArrowRight size={17}/></button></div></section>;
 }
 function SchultePage(props:{best:number|null;onComplete:(seconds:number)=>void}) {
   const [grid,setGrid]=useState<number[]>([]),[target,setTarget]=useState(1),[running,setRunning]=useState(false);
@@ -308,10 +327,10 @@ function ProgressPage(props:{user:User|null;completed:number[];streak:number;bes
       <div className="progress-hero-card"><div className="progress-card-text"><span className="section-kicker">ТВОЯ БИБЛИОТЕКА</span><strong>{props.completed.length}<small> / 520</small></strong><p>заданий пройдено</p><div className="big-progress"><i style={{width:percent+"%"}}/></div><span className="progress-percent">{percent}% пути</span></div><div className="progress-orbit"><div><span>{props.completed.length?percent+"%":"✳"}</span><small>{props.completed.length?"ПРОГРЕСС":"НАЧАЛО"}</small></div></div><span className="card-star">✳</span></div>
       <div className="dashboard-stats"><div className="dash-stat"><span className="dash-icon dash-lime"><Flame size={18}/></span><small>СЕРИЯ ДНЕЙ</small><strong>{props.streak}</strong><span>{props.streak?"ритм держится":"начни сегодня"}</span></div><div className="dash-stat"><span className="dash-icon dash-peach"><Sparkles size={18}/></span><small>СОБРАНО ИСКР</small><strong>{props.completed.length}</strong><span>одна за задачу</span></div><div className="dash-stat"><span className="dash-icon dash-blue"><Clock3 size={18}/></span><small>ШУЛЬТЕ · ЛУЧШЕЕ</small><strong>{props.best?props.best.toFixed(1):"—"}</strong><span>{props.best?"секунд":"ещё впереди"}</span></div></div>
       <div className="recent-card"><div className="recent-head"><div><span className="section-kicker">ПОСЛЕДНИЙ ШАГ</span><h3>{props.completed.length?"Задание №"+String(props.completed[props.completed.length-1]).padStart(3,"0"):"Начни с первой строки"}</h3></div><span className="recent-check"><Check size={17}/></span></div><p>{props.completed.length?"Маленький шаг тоже считается. Продолжай, когда захочешь.":"Прочитай текст и найди спрятанный образ."}</p><button className="text-button text-button-dark" onClick={props.onStart}>Продолжить маршрут <ArrowRight size={16}/></button></div>
-    </div><aside className="subscription-card"><div className="subscription-header"><span className="section-kicker">ТВОЙ ДОСТУП</span><span className={"subscription-status "+(props.user?.accessActive?"status-active":"")}><i/>{props.user?(props.user.accessActive?"Активен":"Завершён"):"Не оформлен"}</span></div><div className="subscription-price"><strong>150 ₽</strong><span>/ 30 дней</span></div><p>Полный доступ ко всем текстам и таблицам. Без автоматического списания.</p><div className="subscription-divider"/>
+    </div><aside className="subscription-card"><div className="subscription-header"><span className="section-kicker">ТВОЙ ДОСТУП</span><span className={"subscription-status "+(props.user?.accessActive?"status-active":"")}><i/>{props.user?(props.user.accessActive?"Активен":"Завершён"):"Не оформлен"}</span></div><div className="subscription-price"><strong>200 ⭐</strong><span>/ 30 дней</span></div><p>Полный доступ ко всем текстам и таблицам. Без автоматического списания.</p><div className="subscription-divider"/>
       <div className="subscription-includes"><span><Check size={15}/>520 текстов и мини-историй</span><span><Check size={15}/>4 уровня сложности</span><span><Check size={15}/>Прогресс и серия дней</span><span><Check size={15}/>Таблица Шульте 5 × 5</span></div>
       <button className="button button-dark subscription-button" onClick={props.user?props.onPay:props.onAuth}>{props.user?(props.user.accessActive?"Продлить доступ":"Открыть доступ"):"Начать с бесплатного дня"} <ArrowRight size={16}/></button>
-      <small className="trial-note">{props.user?"Доступ до "+until:"1 день бесплатно, затем 150 ₽ за 30 дней"}</small><div className="subscription-footer"><LockKeyhole size={13}/><span>Оплата подтверждается ЮMoney</span></div>
+      <small className="trial-note">{props.user?"Доступ до "+until:"1 день бесплатно, затем 200 ⭐ за 30 дней"}</small><div className="subscription-footer"><LockKeyhole size={13}/><span>Оплата подтверждается Telegram Stars</span></div>
     </aside></div>
   </section>;
 }

@@ -3,7 +3,6 @@ frontend/dist/
 backend/data/
 .env
 *.tmp
-.env.example
 .cache/
-
+.env.example
 *.tsbuildinfo

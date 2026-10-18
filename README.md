@@ -18,20 +18,16 @@ Vite проксирует /api на Go-сервер localhost:8080. Аккаун
 
 В production выставь APP_ENV=production: регистрация не будет работать без полного SMTP-набора и SESSION_SECRET. Возьми .env.example за основу конфигурации. В реальном .env не оставляй примерные секреты.
 
-## ЮMoney
+## Telegram Mini App и Stars
 
-Чтобы включить оплату, настрой кошелёк и HTTP-уведомления ЮMoney:
+Создай бота через BotFather и укажи его токен в `TELEGRAM_BOT_TOKEN`. Задай случайный секрет в `TELEGRAM_WEBHOOK_SECRET`, опубликуй приложение по HTTPS и установи webhook бота на `https://example.ru/api/telegram/webhook`, передав тот же секрет как `secret_token` в `setWebhook`. В настройках бота укажи HTTPS-адрес Mini App.
 
-- YOOMONEY_RECEIVER — номер кошелька;
-- YOOMONEY_NOTIFICATION_SECRET — секрет HTTP-уведомлений;
-- APP_BASE_URL — внешний адрес сайта.
+Внутри Telegram сервер проверяет подпись и срок действия `initData` с помощью токена бота, затем создаёт сессию с HttpOnly cookie. Счёт создаётся через Telegram Bot API в валюте `XTR`; подписка стоит 200 Stars за 30 дней. Доступ продлевается только после серверной проверки подписанного webhook, `pre_checkout_query`, валюты, суммы, владельца счёта и Telegram charge ID. Повторные уведомления обрабатываются идемпотентно. Платёж разовый, автоматического списания нет.
 
-В кабинете кошелька укажи URL уведомлений https://example.ru/api/yoomoney/notify. Сервер сверяет подпись уведомления, метку платежа и сумму списания в 150 ₽. Доступ включается только после подтверждения перевода и продлевается на 30 дней.
-
-ЮMoney Quickpay оформляет разовый перевод, поэтому продление здесь ручное: автоматическое ежемесячное списание не подключено. Подробнее: [форма перевода ЮMoney](https://yoomoney.ru/docs/payment-buttons/using-api/forms) и [HTTP-уведомления](https://yoomoney.ru/docs/payment-buttons/using-api/notifications).
+Обычный вход по электронной почте и локальная веб-разработка остаются доступны вне Telegram. Для оплаты требуется открыть приложение внутри Telegram.
 
 ## Сборка для Go-сервера
 
 В папке frontend выполни npm install и npm run build. Затем из корня запусти go run ./backend. Go отдаёт интерфейс из frontend/dist и API на порту 8080.
 
-Для production включи HTTPS, задай APP_SECURE_COOKIES=true, внешний APP_BASE_URL, длинный случайный SESSION_SECRET, APP_ENV=production, SMTP и настройки ЮMoney. Не публикуй пароли и платёжные секреты.
+Для production включи HTTPS, задай APP_SECURE_COOKIES=true, длинный случайный SESSION_SECRET, APP_ENV=production, SMTP и настройки Telegram. Не публикуй пароли, токены ботов и webhook-секреты.

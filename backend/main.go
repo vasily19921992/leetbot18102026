@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -27,7 +28,7 @@ import (
 
 const trialLength = 24 * time.Hour
 const monthLength = 30 * 24 * time.Hour
-const monthlyPrice = 150
+const monthlyPrice = 200
 
 type User struct {
 	Email             string    "json:\"email\""
@@ -40,14 +41,20 @@ type User struct {
 	VerificationUntil time.Time "json:\"verificationUntil\""
 	Completed         []int     "json:\"completed\""
 	FocusSeconds      int       "json:\"focusSeconds\""
+	TelegramID        int64     "json:\"telegramId,omitempty\""
+	TelegramUsername  string    "json:\"telegramUsername,omitempty\""
+	TelegramName      string    "json:\"telegramName,omitempty\""
 }
 type Payment struct {
 	Label       string    "json:\"label\""
 	Email       string    "json:\"email\""
+	UserID      string    "json:\"userId,omitempty\""
 	Amount      int       "json:\"amount\""
+	Currency    string    "json:\"currency,omitempty\""
 	Status      string    "json:\"status\""
 	CreatedAt   time.Time "json:\"createdAt\""
 	OperationID string    "json:\"operationId,omitempty\""
+	ChargeID    string    "json:\"chargeId,omitempty\""
 }
 type diskState struct {
 	Users     map[string]*User    "json:\"users\""
@@ -78,8 +85,11 @@ type TextTemplate struct {
 	Lines    []string
 }
 type Server struct {
-	store         *Store
-	sessionSecret []byte
+	store                 *Store
+	sessionSecret         []byte
+	telegramBotToken      string
+	telegramWebhookSecret string
+	telegramHTTPClient    *http.Client
 }
 
 func main() {
@@ -97,7 +107,13 @@ func main() {
 		secret = "local-only-change-this-session-secret"
 		log.Println("SESSION_SECRET is unset; using a development-only key")
 	}
-	s := &Server{store: store, sessionSecret: []byte(secret)}
+	s := &Server{
+		store:                 store,
+		sessionSecret:         []byte(secret),
+		telegramBotToken:      strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
+		telegramWebhookSecret: strings.TrimSpace(os.Getenv("TELEGRAM_WEBHOOK_SECRET")),
+		telegramHTTPClient:    &http.Client{Timeout: 10 * time.Second},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/exercises", s.exercises)
@@ -105,10 +121,12 @@ func main() {
 	mux.HandleFunc("POST /api/verify-email", s.verifyEmail)
 	mux.HandleFunc("POST /api/login", s.login)
 	mux.HandleFunc("POST /api/logout", s.logout)
+	mux.HandleFunc("POST /api/telegram/auth", s.telegramAuth)
+	mux.HandleFunc("POST /api/telegram/webhook", s.telegramWebhook)
 	mux.HandleFunc("GET /api/me", s.me)
 	mux.HandleFunc("POST /api/progress", s.progress)
 	mux.HandleFunc("POST /api/payment/start", s.startPayment)
-	mux.HandleFunc("POST /api/yoomoney/notify", s.yoomoneyNotify)
+	mux.HandleFunc("GET /api/payment/status", s.paymentStatus)
 	mux.Handle("/", s.frontend())
 	addr := env("LISTEN_ADDR", ":8080")
 	log.Printf("Летри запущен на %s", addr)
@@ -119,6 +137,99 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) exercises(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, generateExercises())
+}
+
+type telegramUser struct {
+	ID        int64  `json:"id"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Username  string `json:"username"`
+}
+
+func validateTelegramInitData(initData, botToken string, now time.Time) (telegramUser, error) {
+	var user telegramUser
+	values, err := url.ParseQuery(initData)
+	if err != nil || initData == "" {
+		return user, errors.New("invalid init data")
+	}
+	for _, entries := range values {
+		if len(entries) != 1 {
+			return user, errors.New("duplicate init data parameter")
+		}
+	}
+	hash := values.Get("hash")
+	providedHash, err := hex.DecodeString(hash)
+	if err != nil || len(providedHash) != sha256.Size {
+		return user, errors.New("invalid init data hash")
+	}
+	authDate, err := strconv.ParseInt(values.Get("auth_date"), 10, 64)
+	if err != nil || authDate > now.Add(time.Minute).Unix() || now.Unix()-authDate > int64((24*time.Hour)/time.Second) {
+		return user, errors.New("init data is expired")
+	}
+	keys := make([]string, 0, len(values)-1)
+	for key := range values {
+		if key != "hash" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		lines = append(lines, key+"="+values.Get(key))
+	}
+	secretMAC := hmac.New(sha256.New, []byte("WebAppData"))
+	_, _ = secretMAC.Write([]byte(botToken))
+	checkMAC := hmac.New(sha256.New, secretMAC.Sum(nil))
+	_, _ = checkMAC.Write([]byte(strings.Join(lines, "\n")))
+	if !hmac.Equal(providedHash, checkMAC.Sum(nil)) {
+		return user, errors.New("init data signature does not match")
+	}
+	if err := json.Unmarshal([]byte(values.Get("user")), &user); err != nil || user.ID < 1 {
+		return user, errors.New("invalid Telegram user")
+	}
+	return user, nil
+}
+
+func (s *Server) telegramAuth(w http.ResponseWriter, r *http.Request) {
+	if s.telegramBotToken == "" {
+		jsonError(w, http.StatusServiceUnavailable, "Telegram Mini App не настроен.")
+		return
+	}
+	var in struct {
+		InitData string `json:"initData"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	tgUser, err := validateTelegramInitData(in.InitData, s.telegramBotToken, time.Now().UTC())
+	if err != nil {
+		jsonError(w, http.StatusUnauthorized, "Не удалось проверить данные Telegram. Открой приложение из Telegram.")
+		return
+	}
+	userID := "telegram:" + strconv.FormatInt(tgUser.ID, 10)
+	name := strings.TrimSpace(strings.TrimSpace(tgUser.FirstName) + " " + strings.TrimSpace(tgUser.LastName))
+	if name == "" {
+		name = tgUser.Username
+	}
+	s.store.Lock()
+	user := s.store.users[userID]
+	if user == nil {
+		now := time.Now().UTC()
+		user = &User{CreatedAt: now, TrialEndsAt: now.Add(trialLength), Completed: []int{}}
+		s.store.users[userID] = user
+	}
+	user.TelegramID = tgUser.ID
+	user.TelegramUsername = tgUser.Username
+	user.TelegramName = name
+	if err := s.store.saveLocked(); err != nil {
+		s.store.Unlock()
+		jsonError(w, http.StatusInternalServerError, "Не удалось сохранить Telegram-аккаунт.")
+		return
+	}
+	public := s.publicUser(user, time.Now().UTC())
+	s.store.Unlock()
+	s.setSession(w, userID)
+	jsonOut(w, http.StatusOK, map[string]any{"user": public})
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
@@ -263,13 +374,13 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	email, ok := s.sessionEmail(r)
+	userID, ok := s.sessionUserID(r)
 	if !ok {
 		jsonError(w, 401, "Войди в аккаунт.")
 		return
 	}
 	s.store.RLock()
-	u := s.store.users[email]
+	u := s.store.users[userID]
 	if u == nil {
 		s.store.RUnlock()
 		jsonError(w, 401, "Аккаунт не найден.")
@@ -280,7 +391,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, map[string]any{"user": data})
 }
 func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
-	email, ok := s.sessionEmail(r)
+	userID, ok := s.sessionUserID(r)
 	if !ok {
 		jsonError(w, 401, "Войди, чтобы сохранить прогресс.")
 		return
@@ -298,7 +409,7 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.Lock()
 	defer s.store.Unlock()
-	u := s.store.users[email]
+	u := s.store.users[userID]
 	if u == nil {
 		jsonError(w, 401, "Аккаунт не найден.")
 		return
@@ -327,99 +438,254 @@ func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, 200, map[string]any{"user": s.publicUser(u, time.Now().UTC())})
 }
 func (s *Server) startPayment(w http.ResponseWriter, r *http.Request) {
-	email, ok := s.sessionEmail(r)
+	userID, ok := s.sessionUserID(r)
 	if !ok {
 		jsonError(w, 401, "Войди, чтобы оформить доступ.")
 		return
 	}
-	receiver := strings.TrimSpace(os.Getenv("YOOMONEY_RECEIVER"))
-	if receiver == "" || os.Getenv("YOOMONEY_NOTIFICATION_SECRET") == "" {
-		jsonError(w, 503, "Оплата не настроена. Добавь реквизиты ЮMoney в .env.")
+	if s.telegramBotToken == "" || s.telegramWebhookSecret == "" {
+		jsonError(w, http.StatusServiceUnavailable, "Оплата Telegram Stars не настроена.")
 		return
 	}
+	s.store.RLock()
+	user := s.store.users[userID]
+	if user == nil || user.TelegramID == 0 {
+		s.store.RUnlock()
+		jsonError(w, http.StatusBadRequest, "Оплатить доступ можно из Telegram Mini App.")
+		return
+	}
+	s.store.RUnlock()
 	raw := make([]byte, 12)
 	if _, err := rand.Read(raw); err != nil {
-		jsonError(w, 500, "Не удалось подготовить платёж.")
+		jsonError(w, http.StatusInternalServerError, "Не удалось подготовить платёж.")
 		return
 	}
-	label := "leet_" + hex.EncodeToString(raw)
+	label := "letri_" + hex.EncodeToString(raw)
 	now := time.Now().UTC()
-	payment := &Payment{Label: label, Email: email, Amount: monthlyPrice, Status: "pending", CreatedAt: now}
+	payment := &Payment{Label: label, UserID: userID, Amount: monthlyPrice, Currency: "XTR", Status: "pending", CreatedAt: now}
 	s.store.Lock()
 	s.store.payments[label] = payment
 	if err := s.store.saveLocked(); err != nil {
 		delete(s.store.payments, label)
 		s.store.Unlock()
-		jsonError(w, 500, "Не удалось подготовить платёж.")
+		jsonError(w, http.StatusInternalServerError, "Не удалось подготовить платёж.")
 		return
 	}
 	s.store.Unlock()
-	base := env("APP_BASE_URL", "http://localhost:8080")
-	jsonOut(w, 200, map[string]string{"action": "https://yoomoney.ru/quickpay/confirm", "receiver": receiver, "quickpay-form": "button", "paymentType": "AC", "sum": strconv.Itoa(monthlyPrice), "label": label, "successURL": base + "/?payment=waiting"})
+	invoiceLink, err := s.createTelegramInvoice(label)
+	if err != nil {
+		log.Printf("create Telegram Stars invoice: %v", err)
+		s.store.Lock()
+		payment.Status = "failed"
+		if saveErr := s.store.saveLocked(); saveErr != nil {
+			log.Printf("save failed Telegram Stars payment: %v", saveErr)
+		}
+		s.store.Unlock()
+		jsonError(w, http.StatusBadGateway, "Не удалось создать счёт Telegram Stars. Попробуй ещё раз.")
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]string{"invoiceLink": invoiceLink, "paymentId": label})
 }
-func (s *Server) yoomoneyNotify(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", 400)
+
+func (s *Server) paymentStatus(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.sessionUserID(r)
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "Войди, чтобы проверить оплату.")
 		return
 	}
-	sign := r.Form.Get("sign")
-	secret := os.Getenv("YOOMONEY_NOTIFICATION_SECRET")
-	if sign == "" || secret == "" || !hmac.Equal([]byte(sign), []byte(yoomoneySign(r.Form, secret))) {
-		http.Error(w, "invalid signature", 403)
+	paymentID := r.URL.Query().Get("id")
+	s.store.RLock()
+	payment := s.store.payments[paymentID]
+	found := payment != nil
+	owned := found && payment.UserID == userID
+	paid := owned && payment.Status == "paid"
+	s.store.RUnlock()
+	if paymentID == "" || !owned {
+		jsonError(w, http.StatusNotFound, "Платёж не найден.")
 		return
 	}
-	if r.Form.Get("currency") != "643" || r.Form.Get("codepro") == "true" || r.Form.Get("unaccepted") == "true" {
-		http.Error(w, "payment not accepted", 400)
+	jsonOut(w, http.StatusOK, map[string]bool{"paid": paid})
+}
+
+type telegramPreCheckoutQuery struct {
+	ID             string       `json:"id"`
+	From           telegramUser `json:"from"`
+	Currency       string       `json:"currency"`
+	TotalAmount    int          `json:"total_amount"`
+	InvoicePayload string       `json:"invoice_payload"`
+}
+
+type telegramSuccessfulPayment struct {
+	Currency                string `json:"currency"`
+	TotalAmount             int    `json:"total_amount"`
+	InvoicePayload          string `json:"invoice_payload"`
+	TelegramPaymentChargeID string `json:"telegram_payment_charge_id"`
+}
+
+type telegramUpdate struct {
+	PreCheckoutQuery *telegramPreCheckoutQuery `json:"pre_checkout_query"`
+	Message          *struct {
+		From              telegramUser               `json:"from"`
+		SuccessfulPayment *telegramSuccessfulPayment `json:"successful_payment"`
+	} `json:"message"`
+}
+
+func (s *Server) telegramWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.telegramBotToken == "" || s.telegramWebhookSecret == "" {
+		http.Error(w, "webhook not configured", http.StatusServiceUnavailable)
 		return
 	}
-	amount, err := parseCents(r.Form.Get("withdraw_amount"))
-	if err != nil || amount != monthlyPrice*100 {
-		http.Error(w, "incorrect amount", 400)
+	provided := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+	if !hmac.Equal([]byte(provided), []byte(s.telegramWebhookSecret)) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	kind := r.Form.Get("notification_type")
-	if kind != "p2p-incoming" && kind != "card-incoming" {
-		http.Error(w, "unsupported transfer", 400)
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+	var update telegramUpdate
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		http.Error(w, "invalid update", http.StatusBadRequest)
 		return
 	}
-	label := r.Form.Get("label")
-	operation := r.Form.Get("operation_id")
-	if label == "" || operation == "" {
-		http.Error(w, "missing reference", 400)
+	if query := update.PreCheckoutQuery; query != nil {
+		s.answerTelegramPreCheckout(w, query)
 		return
+	}
+	if update.Message != nil && update.Message.SuccessfulPayment != nil {
+		if err := s.applyTelegramPayment(update.Message.From.ID, update.Message.SuccessfulPayment); err != nil {
+			log.Printf("apply Telegram Stars payment: %v", err)
+			status := http.StatusInternalServerError
+			if errors.Is(err, errInvalidTelegramPayment) {
+				status = http.StatusBadRequest
+			}
+			http.Error(w, "payment not accepted", status)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) answerTelegramPreCheckout(w http.ResponseWriter, query *telegramPreCheckoutQuery) {
+	s.store.RLock()
+	payment := s.store.payments[query.InvoicePayload]
+	valid := payment != nil && payment.Status == "pending" &&
+		payment.Amount == monthlyPrice && payment.Currency == "XTR" &&
+		payment.UserID == "telegram:"+strconv.FormatInt(query.From.ID, 10) &&
+		query.Currency == "XTR" && query.TotalAmount == monthlyPrice
+	s.store.RUnlock()
+	answer := map[string]any{"pre_checkout_query_id": query.ID, "ok": valid}
+	if !valid {
+		answer["error_message"] = "Счёт не найден или его сумма изменилась. Создай новый счёт."
+	}
+	if err := s.callTelegram("answerPreCheckoutQuery", answer, nil); err != nil {
+		log.Printf("answer Telegram pre-checkout query: %v", err)
+		http.Error(w, "could not confirm pre-checkout", http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) applyTelegramPayment(telegramID int64, paid *telegramSuccessfulPayment) error {
+	if telegramID < 1 || paid.Currency != "XTR" || paid.TotalAmount != monthlyPrice ||
+		paid.InvoicePayload == "" || paid.TelegramPaymentChargeID == "" {
+		return errInvalidTelegramPayment
 	}
 	s.store.Lock()
 	defer s.store.Unlock()
-	if s.store.processed[operation] {
-		w.WriteHeader(200)
-		return
+	if s.store.processed[paid.TelegramPaymentChargeID] {
+		return nil
 	}
-	payment := s.store.payments[label]
-	if payment == nil || payment.Status != "pending" || payment.Amount != monthlyPrice {
-		http.Error(w, "unknown payment", 404)
-		return
+	payment := s.store.payments[paid.InvoicePayload]
+	userID := "telegram:" + strconv.FormatInt(telegramID, 10)
+	if payment == nil || payment.Status != "pending" || payment.Amount != monthlyPrice ||
+		payment.Currency != "XTR" || payment.UserID != userID {
+		return errInvalidTelegramPayment
 	}
-	u := s.store.users[payment.Email]
-	if u == nil {
-		http.Error(w, "account not found", 404)
-		return
+	user := s.store.users[userID]
+	if user == nil || user.TelegramID != telegramID {
+		return errInvalidTelegramPayment
 	}
-	start := time.Now().UTC()
-	if u.TrialEndsAt.After(start) {
-		start = u.TrialEndsAt
+	now := time.Now().UTC()
+	start := now
+	if user.TrialEndsAt.After(start) {
+		start = user.TrialEndsAt
 	}
-	if u.PaidUntil.After(start) {
-		start = u.PaidUntil
+	if user.PaidUntil.After(start) {
+		start = user.PaidUntil
 	}
-	u.PaidUntil = start.Add(monthLength)
+	oldPaidUntil := user.PaidUntil
+	user.PaidUntil = start.Add(monthLength)
 	payment.Status = "paid"
-	payment.OperationID = operation
-	s.store.processed[operation] = true
+	payment.ChargeID = paid.TelegramPaymentChargeID
+	s.store.processed[paid.TelegramPaymentChargeID] = true
 	if err := s.store.saveLocked(); err != nil {
-		http.Error(w, "storage error", 500)
-		return
+		user.PaidUntil = oldPaidUntil
+		payment.Status = "pending"
+		payment.ChargeID = ""
+		delete(s.store.processed, paid.TelegramPaymentChargeID)
+		return fmt.Errorf("save paid subscription: %w", err)
 	}
-	w.WriteHeader(200)
+	return nil
+}
+
+var errInvalidTelegramPayment = errors.New("Telegram payment does not match a pending invoice")
+
+func (s *Server) createTelegramInvoice(payload string) (string, error) {
+	var result string
+	request := map[string]any{
+		"title":          "Летри — доступ на 30 дней",
+		"description":    "Полный доступ к тренировкам и прогрессу на 30 дней.",
+		"payload":        payload,
+		"provider_token": "",
+		"currency":       "XTR",
+		"prices":         []map[string]any{{"label": "Доступ на 30 дней", "amount": monthlyPrice}},
+	}
+	if err := s.callTelegram("createInvoiceLink", request, &result); err != nil {
+		return "", err
+	}
+	if result == "" {
+		return "", errors.New("Telegram returned an empty invoice link")
+	}
+	return result, nil
+}
+
+func (s *Server) callTelegram(method string, request any, result any) error {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("encode Telegram API request: %w", err)
+	}
+	endpoint := "https://api.telegram.org/bot" + s.telegramBotToken + "/" + method
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("create Telegram API request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := s.telegramHTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("call Telegram API: %w", err)
+	}
+	defer response.Body.Close()
+	var envelope struct {
+		OK          bool            `json:"ok"`
+		Result      json.RawMessage `json:"result"`
+		Description string          `json:"description"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil {
+		return fmt.Errorf("decode Telegram API response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.OK {
+		return fmt.Errorf("Telegram API %s failed: %s", method, envelope.Description)
+	}
+	if result != nil {
+		if err := json.Unmarshal(envelope.Result, result); err != nil {
+			return fmt.Errorf("decode Telegram API result: %w", err)
+		}
+	}
+	return nil
 }
 func (st *Store) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(st.path), 0755); err != nil {
@@ -536,7 +802,7 @@ func (s *Server) publicUser(u *User, now time.Time) map[string]any {
 		until = u.PaidUntil
 		plan = "paid"
 	}
-	return map[string]any{"email": u.Email, "createdAt": u.CreatedAt, "trialEndsAt": u.TrialEndsAt, "paidUntil": u.PaidUntil, "accessUntil": until, "accessActive": now.Before(until), "plan": plan, "completed": u.Completed, "focusSeconds": u.FocusSeconds, "emailVerified": u.EmailVerified, "totalExercises": 520}
+	return map[string]any{"email": u.Email, "name": u.TelegramName, "telegram": u.TelegramID != 0, "createdAt": u.CreatedAt, "trialEndsAt": u.TrialEndsAt, "paidUntil": u.PaidUntil, "accessUntil": until, "accessActive": now.Before(until), "plan": plan, "completed": u.Completed, "focusSeconds": u.FocusSeconds, "emailVerified": u.EmailVerified, "totalExercises": 520}
 }
 func (s *Server) hasAccess(u *User, now time.Time) bool {
 	until := u.TrialEndsAt
@@ -553,7 +819,7 @@ func (s *Server) setSession(w http.ResponseWriter, email string) {
 	token := payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	http.SetCookie(w, &http.Cookie{Name: "leet_session", Value: token, Path: "/", Expires: time.Unix(expires, 0), MaxAge: 14 * 24 * 3600, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureCookies()})
 }
-func (s *Server) sessionEmail(r *http.Request) (string, bool) {
+func (s *Server) sessionUserID(r *http.Request) (string, bool) {
 	cookie, err := r.Cookie("leet_session")
 	if err != nil {
 		return "", false
@@ -657,63 +923,6 @@ func sendVerification(to, code string) error {
 	auth := smtp.PlainAuth("", os.Getenv("SMTP_USERNAME"), os.Getenv("SMTP_PASSWORD"), host)
 	body := "To: " + to + "\r\nSubject: Letri email verification\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nКод подтверждения: " + code + "\r\nДействует 30 минут.\r\n"
 	return smtp.SendMail(address, auth, os.Getenv("SMTP_FROM"), []string{to}, []byte(body))
-}
-func yoomoneySign(form url.Values, secret string) string {
-	keys := make([]string, 0, len(form))
-	for key := range form {
-		if key != "sign" {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		parts = append(parts, key+"="+rfc3986(form.Get(key)))
-	}
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(strings.Join(parts, "&")))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-func rfc3986(value string) string {
-	const digits = "0123456789ABCDEF"
-	var out strings.Builder
-	for _, b := range []byte(value) {
-		if b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '.' || b == '~' {
-			out.WriteByte(b)
-		} else {
-			out.WriteByte('%')
-			out.WriteByte(digits[b>>4])
-			out.WriteByte(digits[b&15])
-		}
-	}
-	return out.String()
-}
-func parseCents(value string) (int, error) {
-	parts := strings.Split(value, ".")
-	if len(parts) > 2 || parts[0] == "" {
-		return 0, fmt.Errorf("invalid amount")
-	}
-	rubles, err := strconv.Atoi(parts[0])
-	if err != nil || rubles < 0 {
-		return 0, fmt.Errorf("invalid amount")
-	}
-	kopecks := 0
-	if len(parts) == 2 {
-		digits := parts[1]
-		if len(digits) > 2 {
-			return 0, fmt.Errorf("invalid amount")
-		}
-		if len(digits) == 1 {
-			digits += "0"
-		}
-		if digits != "" {
-			kopecks, err = strconv.Atoi(digits)
-			if err != nil {
-				return 0, fmt.Errorf("invalid amount")
-			}
-		}
-	}
-	return rubles*100 + kopecks, nil
 }
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
