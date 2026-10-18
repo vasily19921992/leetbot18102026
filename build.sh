@@ -4,6 +4,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# Optional: decode fixed main.go if shipped as base64 parts
+if [ -f main.go.b64 ] || [ -f main.go.b64.part0 ]; then
+  echo "→ assembling and decoding main.go from base64 parts"
+  if [ -f main.go.b64.part0 ]; then
+    cat main.go.b64.part0 main.go.b64.part1 main.go.b64.part2 main.go.b64.part3 main.go.b64.part4 > main.go.b64
+  fi
+  base64 -d main.go.b64 > main.go
+  mkdir -p backend
+  cp main.go backend/main.go
+fi
+
 ensure_node() {
   if command -v node >/dev/null 2>&1; then
     local major
